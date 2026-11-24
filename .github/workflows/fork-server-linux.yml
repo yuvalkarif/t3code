@@ -24,6 +24,9 @@ jobs:
         with:
           install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts...
 
+      - name: Align package versions to the base release
+        run: node scripts/update-release-package-versions.ts 0.1.11
+
       - name: Build server and web bundle
         run: vp run --filter t3 build
 
