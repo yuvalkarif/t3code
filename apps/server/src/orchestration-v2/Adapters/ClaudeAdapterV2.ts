@@ -1480,6 +1480,35 @@ export function withoutClaudeCanUseToolShadowedWarning<A>(run: () => A): A {
   }
 }
 
+// The SDK ships these at runtime without public typings; the VS Code and desktop hosts use them.
+interface ClaudeRemoteControlQuery {
+  readonly initializationResult: () => Promise<{ readonly remote_control_auto_enable?: boolean }>;
+  readonly enableRemoteControl?: (
+    enabled: boolean,
+  ) => Promise<{ readonly session_url?: string } | undefined>;
+}
+
+// In SDK mode the CLI only reports the user's "Enable Remote Control for all sessions"
+// setting (`remoteControlAtStartup`, or the org default) and leaves starting the bridge
+// to the host. Starting it lists the thread in claude.ai/code and the Claude mobile app.
+const enableClaudeRemoteControl = (query: ClaudeRemoteControlQuery, threadId: ThreadId) =>
+  Effect.gen(function* () {
+    const init = yield* Effect.promise(() => query.initializationResult());
+    if (init.remote_control_auto_enable !== true || query.enableRemoteControl === undefined) {
+      return;
+    }
+    const enable = query.enableRemoteControl.bind(query);
+    const response = yield* Effect.promise(() => enable(true));
+    yield* Effect.logInfo("orchestration-v2.claude-remote-control-enabled", {
+      threadId,
+      sessionUrl: response?.session_url,
+    });
+  }).pipe(
+    Effect.catchCause((cause) =>
+      Effect.logWarning("orchestration-v2.claude-remote-control-failed", { threadId, cause }),
+    ),
+  );
+
 export const layerQueryRunner: Layer.Layer<
   ClaudeAgentSdkQueryRunner,
   never,
@@ -1728,6 +1757,8 @@ export const layerQueryRunner: Layer.Layer<
                     options: loggedClaudeQueryOptions(input.options),
                   },
                 });
+                // Off the boot path: the bridge handshake must not delay the first turn.
+                runFork(enableClaudeRemoteControl(queryRuntime, input.threadId));
               }),
             ).pipe(
               Effect.onError(() =>

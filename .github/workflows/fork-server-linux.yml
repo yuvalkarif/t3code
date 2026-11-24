@@ -1,0 +1,45 @@
+# Fork-only: builds the Linux x64 `t3` server executable from this branch so it
+# can replace ~/.t3/runtime/versions/<version>/t3 on a remote host for testing.
+name: Fork server build (linux-x64)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["rc-test/**"]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          sparse-checkout: |
+            /*
+            !/.repos/
+          sparse-checkout-cone-mode: false
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts...
+
+      - name: Build server and web bundle
+        run: vp run --filter t3 build
+
+      - name: Build CLI single-executable
+        env:
+          T3CODE_TELEMETRY_CHANNEL: dev
+        run: node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Smoke-test executable
+        run: apps/server/dist-exe/t3 --version
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: t3-linux-x64
+          path: |
+            apps/server/dist-exe/
+            apps/server/dist/client/
+          if-no-files-found: error
+          retention-days: 7
