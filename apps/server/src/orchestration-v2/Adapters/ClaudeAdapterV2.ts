@@ -1798,10 +1798,13 @@ export const layerQueryRunner: Layer.Layer<
           (cause) => cause,
         ).pipe(
           Stream.mapAccum(
-            (): SDKMessage | null => null,
-            (heldInit, message): readonly [SDKMessage | null, ReadonlyArray<SDKMessage>] =>
-              orderClaudeReplayFrame(heldInit, message, offeredPromptUuids),
-            { onHalt: (heldInit) => (heldInit === null ? [] : [heldInit]) },
+            (): ReadonlyArray<SDKMessage> | null => null,
+            (
+              held,
+              message,
+            ): readonly [ReadonlyArray<SDKMessage> | null, ReadonlyArray<SDKMessage>] =>
+              orderClaudeReplayFrame(held, message, offeredPromptUuids),
+            { onHalt: (held) => held ?? [] },
           ),
           Stream.catch((cause) =>
             Stream.fromEffect(
@@ -3961,24 +3964,29 @@ function claudeRemotePromptText(message: SDKMessage): string | null {
 
 /**
  * Drops replays of T3's own prompts, which only --replay-user-messages emits, and moves a remote
- * prompt ahead of the turn's `init` frame. The CLI sends `init` first; the idle wake opens on
- * `init`, so the prompt must already be buffered to name the run.
+ * prompt ahead of the turn's `init` frame. The CLI sends `init` and `status` before the replay;
+ * the idle wake opens on `init`, so `init` and the system frames after it wait for the next
+ * non-system frame, and a remote prompt goes first.
  */
 function orderClaudeReplayFrame(
-  heldInit: SDKMessage | null,
+  held: ReadonlyArray<SDKMessage> | null,
   message: SDKMessage,
   offeredPromptUuids: ReadonlySet<string>,
-): readonly [SDKMessage | null, ReadonlyArray<SDKMessage>] {
+): readonly [ReadonlyArray<SDKMessage> | null, ReadonlyArray<SDKMessage>] {
+  const pending = held ?? [];
   if (isClaudeRootPromptReplay(message)) {
     const uuid = Reflect.get(message, "uuid");
     const own = typeof uuid === "string" && offeredPromptUuids.has(uuid);
-    if (own || claudeRemotePromptText(message) === null) return [heldInit, []];
-    return [null, heldInit === null ? [message] : [message, heldInit]];
+    if (own || claudeRemotePromptText(message) === null) return [held, []];
+    return [null, [message, ...pending]];
   }
   if (isClaudeTurnStartMessage(message)) {
-    return [message, heldInit === null ? [] : [heldInit]];
+    return [[message], pending];
   }
-  return [null, heldInit === null ? [message] : [heldInit, message]];
+  if (held !== null && message.type === "system") {
+    return [[...held, message], []];
+  }
+  return [null, [...pending, message]];
 }
 
 const CLAUDE_REMOTE_PROMPT_SUMMARY_LENGTH = 80;
