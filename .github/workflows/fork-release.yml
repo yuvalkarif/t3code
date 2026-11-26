@@ -21,6 +21,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: fork-release
@@ -126,9 +127,79 @@ jobs:
       - name: Publish the release
         run: |
           set -euo pipefail
+          base="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' patches)"
+          {
+            echo "Upstream [T3 Code v$VERSION](https://github.com/$UPSTREAM/releases/tag/v$VERSION) with the \`patches\` branch applied to the Linux x64 server. The other archives are upstream's, unchanged."
+            echo
+            echo "**Patch** ($(git rev-list --count "v$VERSION..HEAD") commit(s), written against $base): [view the diff](https://github.com/$UPSTREAM/compare/v$VERSION...${GITHUB_REPOSITORY%%/*}:t3code:release/v$VERSION)"
+            echo
+            echo '```'
+            git diff --stat "v$VERSION" HEAD
+            echo '```'
+            if [ "$base" != "v$VERSION" ]; then
+              echo
+              echo "Upstream changes since $base in the files the patch touches:"
+              echo
+              echo '```'
+              git diff --stat "$base" "v$VERSION" -- $(git diff --name-only "v$VERSION" HEAD) || true
+              echo '```'
+            fi
+          } > notes.md
           git push --force origin "release/v$VERSION"
           gh release delete "v$VERSION" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
           gh release create "v$VERSION" out/* -R "$GITHUB_REPOSITORY" \
             --target "release/v$VERSION" \
             --title "v$VERSION + Claude Remote Control" \
-            --notes "Upstream T3 Code v$VERSION with the \`patches\` branch applied to the Linux x64 server. Other archives are upstream's."
+            --notes-file notes.md
+
+      - name: Open an issue when the patch does not apply or the build fails
+        if: failure()
+        run: |
+          set -euo pipefail
+          title="Fork release v$VERSION failed"
+          body="The [Fork release run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) for v$VERSION failed. Nothing was published, so SSH machines cannot install v$VERSION from this fork until it is fixed.
+
+          If the patch no longer applies: rebase \`patches\` onto v$VERSION, resolve the conflicts, force-push, then run **Fork release** with version $VERSION."
+          existing="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number -q '.[0].number')"
+          if [ -n "$existing" ]; then gh issue comment "$existing" -R "$GITHUB_REPOSITORY" --body "$body"; else gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "$body"; fi
+
+  # Early warning: does the patch still apply to upstream main, which becomes the next release?
+  canary:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: patches
+          fetch-depth: 0
+          filter: blob:none
+      - name: Try the patch on upstream main
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" main:upstream-main
+          base="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' HEAD)"
+          git checkout -q upstream-main
+          title="Patch will conflict with the next T3 release"
+          existing="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number -q '.[0].number')"
+          if git cherry-pick "$base..patches" >/dev/null 2>&1; then
+            echo "The patch applies cleanly to upstream main."
+            if [ -n "$existing" ]; then gh issue close "$existing" -R "$GITHUB_REPOSITORY" --comment "Applies cleanly to upstream main again."; fi
+            exit 0
+          fi
+          files="$(git diff --name-only --diff-filter=U)"
+          git cherry-pick --abort || true
+          echo "::warning::The patch conflicts with upstream main in: $files"
+          if [ -z "$existing" ]; then
+            gh issue create -R "$GITHUB_REPOSITORY" --title "$title" --body "The \`patches\` branch no longer applies cleanly to upstream main (checked $(date -u +%F)). The next T3 release will need a rebase.
+
+          Conflicting files:
+          \`\`\`
+          $files
+          \`\`\`
+
+          Nothing is broken yet: current releases keep working. To get ahead of it, rebase \`patches\` onto upstream main's changes, or wait for the release and rebase onto its tag."
+          fi
