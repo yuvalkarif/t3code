@@ -81,8 +81,9 @@ jobs:
           # Upstream tags live under refs/upstream-tags so the fork's own release tags never clash.
           git fetch --no-tags "https://github.com/$UPSTREAM.git" "+refs/tags/v*:refs/upstream-tags/v*"
           base=""
-          for t in $(git for-each-ref --sort=-creatordate --format='%(refname:lstrip=1)' refs/upstream-tags/ | grep -v -- '-'); do
-            if git merge-base --is-ancestor "$t" patches; then base="$t"; break; fi
+          # Stable releases only: nightly and preview tags carry a "-" suffix.
+          for name in $(git for-each-ref --sort=-creatordate --format='%(refname:lstrip=2)' refs/upstream-tags/ | grep -v -- '-'); do
+            if git merge-base --is-ancestor "upstream-tags/$name" patches; then base="upstream-tags/$name"; break; fi
           done
           test -n "$base" || { echo "::error::No upstream release tag is an ancestor of patches."; exit 1; }
           echo "base=$base" >> "$GITHUB_ENV"
@@ -190,8 +191,9 @@ jobs:
           # Upstream tags live under refs/upstream-tags so the fork's own release tags never clash.
           git fetch --no-tags "https://github.com/$UPSTREAM.git" "+refs/tags/v*:refs/upstream-tags/v*"
           base=""
-          for t in $(git for-each-ref --sort=-creatordate --format='%(refname:lstrip=1)' refs/upstream-tags/ | grep -v -- '-'); do
-            if git merge-base --is-ancestor "$t" patches; then base="$t"; break; fi
+          # Stable releases only: nightly and preview tags carry a "-" suffix.
+          for name in $(git for-each-ref --sort=-creatordate --format='%(refname:lstrip=2)' refs/upstream-tags/ | grep -v -- '-'); do
+            if git merge-base --is-ancestor "upstream-tags/$name" patches; then base="upstream-tags/$name"; break; fi
           done
           test -n "$base" || { echo "::error::No upstream release tag is an ancestor of patches."; exit 1; }
           git checkout -q upstream-main
