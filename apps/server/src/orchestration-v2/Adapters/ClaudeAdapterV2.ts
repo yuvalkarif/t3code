@@ -104,6 +104,7 @@ import {
   type ModelSelection,
   type OrchestrationV2ConversationMessage,
   type OrchestrationV2ExecutionNode,
+  type OrchestrationV2Notification,
   type OrchestrationV2ProviderCapabilities,
   type OrchestrationV2ProviderFailure,
   OrchestrationV2ProviderGoal,
@@ -1789,11 +1790,19 @@ export const layerQueryRunner: Layer.Layer<
         ),
       );
 
+      // Prompts T3 offered; the CLI replays them under --replay-user-messages.
+      const offeredPromptUuids = new Set<string>();
       return {
         messages: Stream.fromAsyncIterable(
           claudeQueryMessages(queryRuntime),
           (cause) => cause,
         ).pipe(
+          Stream.mapAccum(
+            (): SDKMessage | null => null,
+            (heldInit, message): readonly [SDKMessage | null, ReadonlyArray<SDKMessage>] =>
+              orderClaudeReplayFrame(heldInit, message, offeredPromptUuids),
+            { onHalt: (heldInit) => (heldInit === null ? [] : [heldInit]) },
+          ),
           Stream.catch((cause) =>
             Stream.fromEffect(
               Effect.gen(function* () {
@@ -1852,7 +1861,10 @@ export const layerQueryRunner: Layer.Layer<
         ),
         offer: (message, onQueued) =>
           Effect.uninterruptibleMask((restore) =>
-            restore(Queue.offer(promptQueue, message)).pipe(
+            Effect.sync(() => {
+              if (message.uuid !== undefined) offeredPromptUuids.add(message.uuid);
+            }).pipe(
+              Effect.andThen(restore(Queue.offer(promptQueue, message))),
               Effect.tap(() => Effect.sync(() => onQueued?.())),
             ),
           ).pipe(
@@ -2341,6 +2353,9 @@ export function makeClaudeQueryOptions(input: {
     input.settings === undefined ? [] : claudeLaunchArgPluginDirectories(input.settings.launchArgs);
   // A bare --plugin-dir still reaches Claude, which reports the missing path.
   if (launchArgPluginDir === null) extraArgs["plugin-dir"] = null;
+  // Remote Control prompts (Claude app, claude.ai/code) reach T3 only as replayed user frames.
+  // The query runner drops replays of T3's own prompts, so only foreign prompts get through.
+  extraArgs["replay-user-messages"] = null;
   const threadIdentity: ClaudeAgentSdkThreadIdentity = input.resume
     ? { resume: input.nativeThreadId }
     : { sessionId: input.nativeThreadId };
@@ -3918,6 +3933,68 @@ function isClaudeLocalCommandEcho(message: SDKMessage): boolean {
   if (message.type !== "user" || !("isReplay" in message) || !message.isReplay) return false;
   const content = message.message.content;
   return typeof content === "string" && content.startsWith("<local-command-stdout>");
+}
+
+function isClaudeRootPromptReplay(message: SDKMessage): boolean {
+  return (
+    message.type === "user" &&
+    Reflect.get(message, "isReplay") === true &&
+    message.parent_tool_use_id === null &&
+    !isClaudeLocalCommandEcho(message)
+  );
+}
+
+// A person's prompt from another Remote Control client; replays of T3's own prompts never reach here.
+function claudeRemotePromptText(message: SDKMessage): string | null {
+  if (!isClaudeRootPromptReplay(message) || message.type !== "user") return null;
+  const origin: unknown = Reflect.get(message, "origin");
+  if (origin === null || typeof origin !== "object" || Reflect.get(origin, "kind") !== "human") {
+    return null;
+  }
+  const content = message.message.content;
+  const text =
+    typeof content === "string"
+      ? content
+      : content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
+  return text.trim().length === 0 ? null : text.trim();
+}
+
+/**
+ * Drops replays of T3's own prompts, which only --replay-user-messages emits, and moves a remote
+ * prompt ahead of the turn's `init` frame. The CLI sends `init` first; the idle wake opens on
+ * `init`, so the prompt must already be buffered to name the run.
+ */
+function orderClaudeReplayFrame(
+  heldInit: SDKMessage | null,
+  message: SDKMessage,
+  offeredPromptUuids: ReadonlySet<string>,
+): readonly [SDKMessage | null, ReadonlyArray<SDKMessage>] {
+  if (isClaudeRootPromptReplay(message)) {
+    const uuid = Reflect.get(message, "uuid");
+    const own = typeof uuid === "string" && offeredPromptUuids.has(uuid);
+    if (own || claudeRemotePromptText(message) === null) return [heldInit, []];
+    return [null, heldInit === null ? [message] : [message, heldInit]];
+  }
+  if (isClaudeTurnStartMessage(message)) {
+    return [message, heldInit === null ? [] : [heldInit]];
+  }
+  return [null, heldInit === null ? [message] : [heldInit, message]];
+}
+
+const CLAUDE_REMOTE_PROMPT_SUMMARY_LENGTH = 80;
+
+function claudeRemotePromptNotification(text: string): OrchestrationV2Notification {
+  const firstLine = text.split("\n")[0]?.trim() ?? "";
+  const label =
+    firstLine.length <= CLAUDE_REMOTE_PROMPT_SUMMARY_LENGTH
+      ? firstLine
+      : `${firstLine.slice(0, CLAUDE_REMOTE_PROMPT_SUMMARY_LENGTH - 1)}…`;
+  return {
+    source: { kind: "system" },
+    outcome: "updated",
+    summary: `From Claude app: ${label}`,
+    detail: text,
+  };
 }
 
 function claudePendingBackgroundTasksFromRoster(
@@ -10260,11 +10337,32 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             return;
           }
           const reports = yield* takeWakeReports(nativeThreadId);
-          const notification = backgroundWorkNotification(
-            monitorEvent
-              ? [{ kind: "monitor", outcome: "updated" }]
-              : [...(reports?.values() ?? [])].map((entry) => entry.report),
-          );
+          // A prompt sent from the Claude app opened this wake; show the person's words on the run.
+          const remotePrompt =
+            buffered?.messages.flatMap((entry) => {
+              const text = claudeRemotePromptText(entry);
+              return text === null ? [] : [text];
+            })[0] ?? null;
+          if (remotePrompt !== null) {
+            yield* Ref.update(wakeBuffers, (current) => {
+              const existing = current.get(nativeThreadId);
+              if (existing === undefined) return current;
+              return new Map(current).set(nativeThreadId, {
+                ...existing,
+                messages: existing.messages.filter(
+                  (entry) => claudeRemotePromptText(entry) === null,
+                ),
+              });
+            });
+          }
+          const notification =
+            remotePrompt !== null
+              ? claudeRemotePromptNotification(remotePrompt)
+              : backgroundWorkNotification(
+                  monitorEvent
+                    ? [{ kind: "monitor", outcome: "updated" }]
+                    : [...(reports?.values() ?? [])].map((entry) => entry.report),
+                );
           yield* Effect.logInfo("orchestration-v2.claude-wake-turn-detected", {
             providerSessionId: input.providerSessionId,
             threadId: route.threadId,
@@ -10277,7 +10375,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             threadId: route.threadId,
             providerThreadId: route.providerThreadId,
             driver: CLAUDE_PROVIDER,
-            detail: buffered?.detail ?? null,
+            detail: remotePrompt ?? buffered?.detail ?? null,
             ...(notification === null ? {} : { notification }),
             clearIfCurrent: retire,
             onRunEndedWithoutStarting: retire,
