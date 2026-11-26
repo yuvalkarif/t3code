@@ -1,0 +1,134 @@
+# Fork-only: republishes each upstream T3 Code release with the `patches` branch applied
+# to the Linux x64 server, in the same layout as upstream's GitHub release. T3 desktop
+# installs it on SSH machines when it runs with
+#   T3CODE_RELEASE_BASE_URL=https://github.com/<this fork>/releases/download
+# The other archives are upstream's, unchanged. If the patch stops applying, the run fails
+# and nothing is published: SSH machines keep the version they have.
+name: Fork release
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Upstream version without the v, such as 0.1.12. Empty means the latest release.
+        required: false
+      force:
+        description: Rebuild even when this fork already has the release.
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: pingdotgg/t3code
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      skip: ${{ steps.v.outputs.skip }}
+    steps:
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          version="${INPUT_VERSION#v}"
+          if [ -z "$version" ]; then
+            version="$(gh release view -R "$UPSTREAM" --json tagName -q .tagName)"
+            version="${version#v}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" != "true" ] && gh release view "v$version" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "v$version is already published here."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.skip != 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out the patches branch
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: patches
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Apply patches to the upstream release
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/v$VERSION:refs/tags/v$VERSION"
+          base="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' HEAD)"
+          echo "Patches: $(git rev-list --count "$base..HEAD") commit(s) on $base"
+          git checkout -B "release/v$VERSION" "v$VERSION"
+          if ! git cherry-pick "$base..patches"; then
+            git cherry-pick --abort || true
+            echo "::error::The patches no longer apply to v$VERSION. Rebase the patches branch onto v$VERSION."
+            exit 1
+          fi
+
+      - name: Setup dependencies
+        uses: ./.github/actions/setup-ci-deps
+        with:
+          install-args: --filter=t3... --filter=@t3tools/web... --filter=@t3tools/scripts...
+
+      - name: Build the server executable
+        env:
+          T3CODE_TELEMETRY_CHANNEL: dev
+        run: |
+          set -euo pipefail
+          node scripts/update-release-package-versions.ts "$VERSION"
+          vp run --filter t3 build
+          node apps/server/scripts/cli.ts build-exe --verbose
+
+      - name: Repack the upstream archive with the patched executable
+        run: |
+          set -euo pipefail
+          command -v patchelf || { sudo apt-get update && sudo apt-get install -y patchelf; }
+          mkdir -p upstream out stage
+          gh release download "v$VERSION" -R "$UPSTREAM" -D upstream -p SHA256SUMS -p "t3-$VERSION-*"
+          (cd upstream && sha256sum -c --ignore-missing SHA256SUMS)
+          name="t3-$VERSION-linux-x64"
+          tar -xzf "upstream/$name.tar.gz" -C stage
+          rpath="$(patchelf --print-rpath "stage/$name/t3")"
+          install -m 0755 apps/server/dist-exe/t3 "stage/$name/t3"
+          if [ -n "$rpath" ]; then patchelf --set-rpath "$rpath" "stage/$name/t3"; fi
+          test "$("stage/$name/t3" --version)" = "t3 v$VERSION"
+          tar -czf "out/$name.tar.gz" --owner=0 --group=0 -C stage "$name"
+          for f in upstream/t3-*; do
+            case "$f" in */"$name.tar.gz") ;; *) cp "$f" out/ ;; esac
+          done
+          (cd out && sha256sum t3-* > SHA256SUMS && cat SHA256SUMS)
+
+      - name: Smoke-test the archive
+        run: node scripts/smoke-cli-archive.ts --archive "out/t3-$VERSION-linux-x64.tar.gz" --expect-version "$VERSION"
+
+      - name: Publish the release
+        run: |
+          set -euo pipefail
+          git push --force origin "release/v$VERSION"
+          gh release delete "v$VERSION" -R "$GITHUB_REPOSITORY" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "v$VERSION" out/* -R "$GITHUB_REPOSITORY" \
+            --target "release/v$VERSION" \
+            --title "v$VERSION + Claude Remote Control" \
+            --notes "Upstream T3 Code v$VERSION with the \`patches\` branch applied to the Linux x64 server. Other archives are upstream's."
