@@ -78,10 +78,16 @@ jobs:
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git fetch --no-tags "https://github.com/$UPSTREAM.git" "refs/tags/v$VERSION:refs/tags/v$VERSION"
-          base="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' HEAD)"
-          echo "Patches: $(git rev-list --count "$base..HEAD") commit(s) on $base"
-          git checkout -B "release/v$VERSION" "v$VERSION"
+          # Upstream tags live under refs/upstream-tags so the fork's own release tags never clash.
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "+refs/tags/v*:refs/upstream-tags/v*"
+          base=""
+          for t in $(git for-each-ref --sort=-creatordate --format='%(refname:lstrip=1)' refs/upstream-tags/ | grep -v -- '-'); do
+            if git merge-base --is-ancestor "$t" patches; then base="$t"; break; fi
+          done
+          test -n "$base" || { echo "::error::No upstream release tag is an ancestor of patches."; exit 1; }
+          echo "base=$base" >> "$GITHUB_ENV"
+          echo "Patches: $(git rev-list --count "$base..patches") commit(s) on ${base#upstream-tags/}"
+          git checkout -B "release/v$VERSION" "upstream-tags/v$VERSION"
           if ! git cherry-pick "$base..patches"; then
             git cherry-pick --abort || true
             echo "::error::The patches no longer apply to v$VERSION. Rebase the patches branch onto v$VERSION."
@@ -127,21 +133,21 @@ jobs:
       - name: Publish the release
         run: |
           set -euo pipefail
-          base="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' patches)"
+          up="upstream-tags/v$VERSION"
           {
             echo "Upstream [T3 Code v$VERSION](https://github.com/$UPSTREAM/releases/tag/v$VERSION) with the \`patches\` branch applied to the Linux x64 server. The other archives are upstream's, unchanged."
             echo
-            echo "**Patch** ($(git rev-list --count "v$VERSION..HEAD") commit(s), written against $base): [view the diff](https://github.com/$UPSTREAM/compare/v$VERSION...${GITHUB_REPOSITORY%%/*}:t3code:release/v$VERSION)"
+            echo "**Patch** ($(git rev-list --count "$up..HEAD") commit(s), written against ${base#upstream-tags/}): [view the diff](https://github.com/$UPSTREAM/compare/v$VERSION...${GITHUB_REPOSITORY%%/*}:t3code:release/v$VERSION)"
             echo
             echo '```'
-            git diff --stat "v$VERSION" HEAD
+            git diff --stat "$up" HEAD
             echo '```'
-            if [ "$base" != "v$VERSION" ]; then
+            if [ "$base" != "$up" ]; then
               echo
-              echo "Upstream changes since $base in the files the patch touches:"
+              echo "Upstream changes since ${base#upstream-tags/} in the files the patch touches:"
               echo
               echo '```'
-              git diff --stat "$base" "v$VERSION" -- $(git diff --name-only "v$VERSION" HEAD) || true
+              git diff --stat "$base" "$up" -- $(git diff --name-only "$up" HEAD) || true
               echo '```'
             fi
           } > notes.md
@@ -181,7 +187,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git fetch --no-tags "https://github.com/$UPSTREAM.git" main:upstream-main
-          base="$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-*' HEAD)"
+          # Upstream tags live under refs/upstream-tags so the fork's own release tags never clash.
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "+refs/tags/v*:refs/upstream-tags/v*"
+          base=""
+          for t in $(git for-each-ref --sort=-creatordate --format='%(refname:lstrip=1)' refs/upstream-tags/ | grep -v -- '-'); do
+            if git merge-base --is-ancestor "$t" patches; then base="$t"; break; fi
+          done
+          test -n "$base" || { echo "::error::No upstream release tag is an ancestor of patches."; exit 1; }
           git checkout -q upstream-main
           title="Patch will conflict with the next T3 release"
           existing="$(gh issue list -R "$GITHUB_REPOSITORY" --state open --search "\"$title\" in:title" --json number -q '.[0].number')"
